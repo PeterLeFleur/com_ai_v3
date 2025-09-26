@@ -1,0 +1,65 @@
+name: COM-AI v3 CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
+    
+    - name: Lint with flake8
+      run: |
+        flake8 src/ tools/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 src/ tools/ tests/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    
+    - name: Format check with black
+      run: black --check src/ tools/ tests/
+    
+    - name: Import sort check with isort
+      run: isort --check-only src/ tools/ tests/
+    
+    - name: Registry validation
+      run: python tools/registry_validate.py
+    
+    - name: Type checking with mypy
+      run: mypy src/ --ignore-missing-imports
+    
+    - name: Security check with bandit
+      run: bandit -r src/ -f json
+    
+    - name: Check session notes updated
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      run: |
+        # Check if SESSION_NOTES.md was modified in the last commit
+        if ! git diff --name-only HEAD~1 HEAD | grep -q "SESSION_NOTES.md"; then
+          echo "WARNING: SESSION_NOTES.md was not updated in this commit"
+          echo "AI collaborators must append session entries per handover protocol"
+          # Note: This is a warning, not a failure, to allow initial setup commits
+        fi
+    
+    - name: Run tests with coverage
+      run: |
+        pytest --cov=src --cov-report=xml --cov-report=term-missing
+    
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+        fail_ci_if_error: false  # Don't fail CI if Codecov upload fails
