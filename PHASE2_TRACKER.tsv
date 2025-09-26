@@ -1,0 +1,4 @@
+Task ID	Component	Description	Owner	Status	Notes/Blockers	Last Updated
+API-001	API	Health endpoint test	GPT	✅ Complete	None	2025-09-25
+BRAIN-001	Brain	CerebrumCadre import check	Claude	🚧 In Prog	Needs provider registry	2025-09-25
+MEM-001	Memory	Firestore client stub	GPT	🟡 Pending	Credentials required	2025-09-25
