@@ -1,1 +1,1 @@
-# COM-AI v3 Brain Providers Package
+# Package for API-tier provider orchestration (manager, adapters).

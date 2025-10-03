@@ -1,40 +1,90 @@
 """
-COM-AI v3 - Logging Configuration
-Standardized logging setup for the entire application
+Safe, non-blocking logging for COM-AI v3
+
+- Uses QueueHandler + QueueListener so request threads never block on I/O
+- Rotates local log file; no network/syslog sinks (Windows-friendly)
+- Respects LOG_LEVEL from env (default INFO)
 """
 
+from __future__ import annotations
+
+import atexit
 import logging
-import sys
+import logging.handlers
 import os
+import queue
+from typing import Optional
 
-def setup_logging(level: str | None = None):
-    if level is None:
-        from src.utils.config import get_settings
-        settings = get_settings()
-        level = settings.log_level
+_LOG_QUEUE: Optional[queue.Queue] = None
+_LISTENER: Optional[logging.handlers.QueueListener] = None
 
-    numeric_level = getattr(logging, level.upper(), logging.INFO)
+def _build_formatter() -> logging.Formatter:
+    # compact, readable; add asctime first for easier tailing
+    return logging.Formatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
-    os.makedirs('logs', exist_ok=True)
+def _build_file_handler(log_dir: str) -> logging.Handler:
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "app.log")
 
-    # Build handlers explicitly to control encodings
-    console = logging.StreamHandler(sys.stdout)
-    console.setLevel(numeric_level)
-    console.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    # 10 MB per file, keep 5 backups
+    fh = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    )
+    fh.setFormatter(_build_formatter())
+    fh.setLevel(logging.DEBUG)  # file gets everything
+    return fh
 
-    fileh = logging.FileHandler('logs/com_ai_v3.log', mode='a', encoding='utf-8')
-    fileh.setLevel(numeric_level)
-    fileh.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+def _build_console_handler() -> logging.Handler:
+    ch = logging.StreamHandler()
+    ch.setFormatter(_build_formatter())
+    # keep console a bit quieter; overridden by LOG_LEVEL if needed
+    ch.setLevel(logging.INFO)
+    return ch
 
+def setup_logging() -> None:
+    """
+    Configure root logger with a QueueHandler feeding a QueueListener
+    that writes to console + rotating file. Idempotent.
+    """
+    global _LOG_QUEUE, _LISTENER
+
+    if _LISTENER is not None:
+        return  # already configured
+
+    # Respect LOG_LEVEL env, default INFO
+    level_str = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_str, logging.INFO)
+
+    # Create the queue and listener targets
+    _LOG_QUEUE = queue.Queue(-1)
+    file_handler = _build_file_handler(log_dir=os.getenv("LOG_DIR", "logs"))
+    console_handler = _build_console_handler()
+
+    # QueueListener writes to the real handlers
+    _LISTENER = logging.handlers.QueueListener(_LOG_QUEUE, file_handler, console_handler, respect_handler_level=True)
+    _LISTENER.start()
+    atexit.register(_stop_listener)
+
+    # Root logger uses a single QueueHandler (non-blocking for producers)
     root = logging.getLogger()
-    root.handlers = []              # reset any previous handlers (e.g., from basicConfig)
-    root.setLevel(numeric_level)
-    root.addHandler(console)
-    root.addHandler(fileh)
+    root.setLevel(level)
+    # Remove any pre-existing handlers to avoid duplicates
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.addHandler(logging.handlers.QueueHandler(_LOG_QUEUE))
 
-    logging.getLogger('uvicorn').setLevel(logging.INFO)
-    logging.getLogger('fastapi').setLevel(logging.INFO)
-    logging.getLogger('src.brain').setLevel(logging.DEBUG)
+    # Quiet down very chatty third-party loggers if desired
+    for noisy in ("uvicorn.error", "uvicorn.access", "watchfiles.main"):
+        logging.getLogger(noisy).setLevel(max(level, logging.WARNING))
 
-    # (Use ASCII text here or ensure console supports UTF-8, which we set in the .bat)
-    logging.getLogger(__name__).info(f"Logging configured - Level: {level}")
+def _stop_listener() -> None:
+    global _LISTENER
+    if _LISTENER is not None:
+        try:
+            _LISTENER.stop()
+        except Exception:
+            pass
+        _LISTENER = None

@@ -1,0 +1,816 @@
+openapi: 3.1.0
+info:
+  title: CCGAI – Brain Methodology API (Phase 2)
+  version: 2.1.0
+  description: >
+    Canonical API contract for Phase 2 of the Brain Methodology:
+    memory (PostgreSQL authoritative + Firestore mirror), authentication,
+    quotas, telemetry, diagnostics, and sanitized provider discovery.
+    This file is the single source of truth; serve a branded alias at /CCGAI.yaml
+    pointing to the same bytes to avoid drift.
+  x-ccg:
+    branding: CCGAI
+    methodology: "Brain Methodology"
+    version_label: "Brain Methodology v2.1.0"
+    phase: "Phase 2"
+servers:
+  - url: http://localhost:8094
+    description: Local dev (primary)
+  - url: http://localhost:8000
+    description: Local dev (alt)
+tags:
+  - name: Brain
+    description: Synthesis endpoints for Brain Methodology
+  - name: Sessions
+    description: Session lifecycle & message retrieval (PG authoritative; Firestore mirror)
+  - name: Health
+    description: Telemetry and provider diagnostics
+  - name: Providers
+    description: Sanitized discovery, config status, and provider tests
+  - name: Config
+    description: User preferences and platform configuration
+  - name: Cadres
+    description: (Optional) Mojo/Zoey task surface; safe & minimal for later use
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: Static API key mapped to a user/tenant
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  headers:
+    XRateLimitLimit:
+      description: The request quota for the current window.
+      schema: { type: integer, minimum: 0 }
+    XRateLimitRemaining:
+      description: Remaining requests in the current window.
+      schema: { type: integer, minimum: 0 }
+    XRateLimitReset:
+      description: Epoch seconds when the quota window resets.
+      schema: { type: integer, minimum: 0 }
+    RateLimitLimit:
+      description: Standard header equivalent to X-RateLimit-Limit.
+      schema: { type: integer, minimum: 0 }
+    RateLimitRemaining:
+      description: Standard header equivalent to X-RateLimit-Remaining.
+      schema: { type: integer, minimum: 0 }
+    RateLimitReset:
+      description: Standard header equivalent to X-RateLimit-Reset.
+      schema: { type: integer, minimum: 0 }
+    XRequestID:
+      description: Server-assigned request id for tracing.
+      schema: { type: string }
+
+  schemas:
+    ChatMessage:
+      type: object
+      additionalProperties: false
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool]
+        content: { type: string }
+      required: [role, content]
+
+    TokenUsage:
+      type: object
+      description: Basic token accounting; allows provider-specific fields.
+      additionalProperties: true
+      properties:
+        input_tokens: { type: integer, minimum: 0 }
+        output_tokens: { type: integer, minimum: 0 }
+        total_tokens: { type: integer, minimum: 0 }
+
+    ErrorResponse:
+      type: object
+      description: Standard error envelope; flexible for provider-specific codes.
+      additionalProperties: true
+      properties:
+        error: { type: string }
+        code:  { type: string, description: "e.g., INVALID_REQUEST, RATE_LIMITED, PROVIDER_ERROR, TIMEOUT, AUTH_EXPIRED, QUOTA_EXCEEDED" }
+        request_id: { type: string, format: uuid }
+        provider: { type: string, nullable: true }
+        details:  { type: object, additionalProperties: true }
+      required: [error, code]
+
+    SynthesizeRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        prompt: { type: string, description: "Simple prompt alternative to messages[]" }
+        messages:
+          type: array
+          items: { $ref: '#/components/schemas/ChatMessage' }
+        system: { type: string, description: "Optional system instruction" }
+        max_tokens: { type: integer, minimum: 1 }
+        temperature: { type: number, minimum: 0, maximum: 2, default: 1.0 }
+        provider: { type: string, description: "Runtime override: openai | anthropic | gemini | ..." }
+        model:    { type: string, description: "Runtime override: provider-specific model name" }
+        fallback: { type: boolean, default: true }
+        user_id:   { type: string }
+        session_id:{ type: string }
+        cadre_id:  { type: string, description: "Optional: 'mojo' or 'zoey' policy application" }
+        metadata:  { type: object, additionalProperties: true }
+      anyOf:
+        - required: [prompt]
+        - required: [messages]
+
+    SynthesizeResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        text: { type: string }
+        provider: { type: string }
+        model: { type: string }
+        latency_ms: { type: integer }
+        token_usage: { $ref: '#/components/schemas/TokenUsage' }
+        request_id: { type: string, format: uuid }
+        fallback_used: { type: boolean, default: false }
+      required: [text, provider, model, latency_ms, token_usage, request_id, fallback_used]
+
+    StreamChunk:
+      type: object
+      description: SSE event chunk for streaming synthesis.
+      additionalProperties: false
+      properties:
+        request_id: { type: string, format: uuid }
+        delta: { type: string, description: "Incremental text tokens" }
+        done: { type: boolean, default: false }
+        usage: { $ref: '#/components/schemas/TokenUsage' }
+
+    ProviderPublic:
+      type: object
+      additionalProperties: false
+      properties:
+        provider_id: { type: string }
+        name: { type: string }
+        template: { type: string, description: "openai | anthropic | gemini | ..." }
+        model_options:
+          type: array
+          items: { type: string }
+        default_model: { type: string, nullable: true }
+        enabled: { type: boolean }
+        priority: { type: integer }
+        tags:
+          type: array
+          items: { type: string }
+        capabilities:
+          type: object
+          additionalProperties: { type: boolean }
+        health:
+          type: object
+          additionalProperties: true
+      required: [provider_id, name, template, model_options, enabled, priority, capabilities]
+
+    ProviderConfigStatus:
+      type: object
+      additionalProperties: false
+      properties:
+        provider_id: { type: string }
+        name: { type: string }
+        enabled: { type: boolean }
+        configured: { type: boolean }
+        healthy: { type: boolean }
+        supported_models:
+          type: array
+          items: { type: string }
+        priority: { type: integer }
+      required: [provider_id, name, enabled, configured, healthy, supported_models, priority]
+
+    ProviderHealthDetail:
+      type: object
+      additionalProperties: false
+      properties:
+        provider_id: { type: string }
+        name: { type: string }
+        healthy: { type: boolean }
+        last_success_at: { type: string, format: date-time, nullable: true }
+        last_error_at: { type: string, format: date-time, nullable: true }
+        latency_ms:
+          type: object
+          additionalProperties: false
+          properties:
+            p50: { type: number }
+            p95: { type: number }
+            p99: { type: number }
+        failure_rate:
+          type: object
+          additionalProperties: false
+          properties:
+            minute: { type: number }
+            hour: { type: number }
+      required: [provider_id, name, healthy]
+
+    UsageBucket:
+      type: object
+      additionalProperties: false
+      properties:
+        bucket: { type: string, description: "YYYY-MM-DD or ISO timestamp bucket" }
+        requests: { type: integer }
+        success: { type: integer }
+        errors: { type: integer }
+        p50_latency_ms: { type: number }
+        p95_latency_ms: { type: number }
+
+    UsageSummary:
+      type: object
+      additionalProperties: false
+      properties:
+        totals:
+          type: object
+          additionalProperties: false
+          properties:
+            requests: { type: integer }
+            success:  { type: integer }
+            errors:   { type: integer }
+            tokens_in:  { type: integer }
+            tokens_out: { type: integer }
+            cost_usd:   { type: number }
+        series:
+          type: array
+          items: { $ref: '#/components/schemas/UsageBucket' }
+
+    Preferences:
+      type: object
+      additionalProperties: false
+      properties:
+        default_provider: { type: string }
+        default_model: { type: string }
+        temperature: { type: number, minimum: 0, maximum: 2 }
+        fallback_policy:
+          type: object
+          additionalProperties: true
+        quota:
+          type: object
+          additionalProperties: false
+          properties:
+            daily_requests_limit: { type: integer }
+            daily_tokens_limit: { type: integer }
+            remaining_requests: { type: integer }
+            reset_at: { type: string, format: date-time }
+
+    Session:
+      type: object
+      additionalProperties: false
+      properties:
+        id: { type: string }
+        user_id: { type: string }
+        title: { type: string }
+        metadata: { type: object, additionalProperties: true }
+        started_at: { type: string, format: date-time }
+        last_active_at: { type: string, format: date-time, nullable: true }
+      required: [id, user_id, title, started_at]
+
+    SessionCreateRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        user_id: { type: string }
+        title: { type: string }
+        metadata: { type: object, additionalProperties: true }
+      required: [user_id, title]
+
+    SessionListResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Session' }
+        next_page_token: { type: string, nullable: true }
+
+    CadrePublic:
+      type: object
+      additionalProperties: false
+      properties:
+        cadre_id: { type: string, description: "e.g., 'mojo', 'zoey'" }
+        display_name: { type: string }
+        role: { type: string, description: "security_acquisition | info_management" }
+        enabled: { type: boolean }
+        capabilities:
+          type: array
+          items: { type: string }
+        policy:
+          type: object
+          additionalProperties: false
+          properties:
+            data_scope:
+              type: string
+              enum: [none, session, tenant]
+            max_tokens: { type: integer }
+            rate_limit_rph: { type: integer }
+      required: [cadre_id, display_name, role, enabled, capabilities]
+
+    CadreTaskRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        task: { type: string, description: "e.g., 'fetch_provider_health', 'summarize_session'" }
+        params: { type: object, additionalProperties: true }
+      required: [task]
+
+    CadreTaskResponse:
+      type: object
+      additionalProperties: true
+      properties:
+        run_id: { type: string, format: uuid }
+        cadre_id: { type: string }
+        status: { type: string, description: "queued | running | success | error" }
+        result: { type: object, additionalProperties: true }
+
+  parameters:
+    QFrom:
+      name: from
+      in: query
+      required: false
+      schema: { type: string, format: date-time }
+    QTo:
+      name: to
+      in: query
+      required: false
+      schema: { type: string, format: date-time }
+    QGroupBy:
+      name: group_by
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [provider, model, date, user, cadre]
+    QUser:
+      name: user_id
+      in: query
+      required: false
+      schema: { type: string }
+    QPageToken:
+      name: page_token
+      in: query
+      required: false
+      schema: { type: string }
+    QLimit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+
+paths:
+  /api/brain/synthesize:
+    post:
+      tags: [Brain]
+      operationId: synthesize
+      summary: Generate a completion with optional runtime overrides
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SynthesizeRequest' }
+      responses:
+        '200':
+          description: Completion created
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/XRequestID' }
+            X-RateLimit-Limit: { $ref: '#/components/headers/XRateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/XRateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/XRateLimitReset' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SynthesizeResponse' }
+        '400': { description: Bad request, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '401': { description: Unauthorized,  content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+        '429':
+          description: Rate limited
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/XRateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/XRateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/XRateLimitReset' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '502': { description: Provider error, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorResponse' } } } }
+
+  /api/brain/synthesize/stream:
+    post:
+      tags: [Brain]
+      operationId: synthesizeStream
+      summary: Streaming completion via Server-Sent Events (SSE)
+      description: Emits `StreamChunk` objects as text/event-stream until `done=true`.
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SynthesizeRequest' }
+      responses:
+        '200':
+          description: Stream opened
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/XRequestID' }
+            X-RateLimit-Limit: { $ref: '#/components/headers/XRateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/XRateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/XRateLimitReset' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            text/event-stream:
+              schema: { $ref: '#/components/schemas/StreamChunk' }
+        '429':
+          description: Rate limited
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/XRateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/XRateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/XRateLimitReset' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/sessions:
+    post:
+      tags: [Sessions]
+      operationId: createSession
+      summary: Create a new session (PG authoritative; optional Firestore mirror)
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SessionCreateRequest' }
+      responses:
+        '201':
+          description: Session created
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/XRequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+    get:
+      tags: [Sessions]
+      operationId: listSessions
+      summary: List sessions (paginated)
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/QUser'
+        - $ref: '#/components/parameters/QLimit'
+        - $ref: '#/components/parameters/QPageToken'
+        - $ref: '#/components/parameters/QFrom'
+        - $ref: '#/components/parameters/QTo'
+      responses:
+        '200':
+          description: Sessions page
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/XRequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionListResponse' }
+
+  /api/sessions/{session_id}:
+    get:
+      tags: [Sessions]
+      operationId: getSession
+      summary: Get a session by id
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Session
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/XRequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/sessions/{session_id}/messages:
+    get:
+      tags: [Sessions]
+      operationId: listSessionMessages
+      summary: List messages for a session (paginated)
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/QLimit'
+        - $ref: '#/components/parameters/QPageToken'
+      responses:
+        '200':
+          description: Messages page (shape is app-specific; simple role/content here)
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/XRequestID' }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ChatMessage' }
+                  next_page_token: { type: string, nullable: true }
+
+  /api/sessions/{session_id}/stream:
+    get:
+      tags: [Sessions]
+      operationId: streamSession
+      summary: Live session event stream (SSE)
+      description: Emits incremental events (e.g., new messages) for a session.
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Stream opened
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/XRequestID' }
+          content:
+            text/event-stream:
+              schema:
+                type: object
+                additionalProperties: true
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/health/usage:
+    get:
+      tags: [Health]
+      operationId: getUsageSummary
+      summary: Aggregated usage metrics across providers/models/users/cadres
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/QFrom'
+        - $ref: '#/components/parameters/QTo'
+        - $ref: '#/components/parameters/QGroupBy'
+      responses:
+        '200':
+          description: Usage aggregates
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/XRequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UsageSummary' }
+
+  /api/health/providers/detail:
+    get:
+      tags: [Health]
+      operationId: getProviderHealthDetail
+      summary: Provider latency, success/error timestamps, and failure rates
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Health details per provider
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/XRequestID' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ProviderHealthDetail' }
+
+  /api/providers/public:
+    get:
+      tags: [Providers]
+      operationId: getPublicProviders
+      summary: Sanitized list of enabled providers (no secrets)
+      description: >
+        Publicly safe endpoint for agents and UIs to discover enabled providers
+        and their model options without exposing API keys or endpoints.
+      responses:
+        '200':
+          description: Sanitized provider list
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/XRequestID' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ProviderPublic' }
+
+  /api/providers/config:
+    get:
+      tags: [Providers]
+      operationId: getProviderConfig
+      summary: Enabled/configured/healthy status for each provider
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Provider configuration status
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/XRequestID' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ProviderConfigStatus' }
+
+  /api/providers/{provider_id}/test:
+    post:
+      tags: [Providers]
+      operationId: testProvider
+      summary: Execute a simple health check prompt against a provider
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      parameters:
+        - name: provider_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                prompt: { type: string, default: "ping" }
+      responses:
+        '200':
+          description: Provider healthy
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/XRequestID' }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                properties:
+                  provider_id: { type: string }
+                  status: { type: string }
+                  latency_ms: { type: number }
+                  sample: { type: string }
+        '404':
+          description: Unknown provider
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '502':
+          description: Provider error
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /api/config/preferences:
+    get:
+      tags: [Config]
+      operationId: getPreferences
+      summary: Get persisted provider defaults for the current user
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      responses:
+        '200':
+          description: User preferences
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/XRequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Preferences' }
+    post:
+      tags: [Config]
+      operationId: savePreferences
+      summary: Save provider defaults for the current user
+      security:
+        - ApiKeyAuth: []
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Preferences' }
+      responses:
+        '204':
+          description: Saved
+        '400':
+          description: Invalid preference document
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  # ---- Cadres: optional, thin surface for Mojo/Zoey (safe to leave idle until later) ----
+  /api/cadres/public:
+    get:
+      tags: [Cadres]
+      operationId: getPublicCadres
+      summary: Sanitized list of available cadres (no secrets)
+      responses:
+        '200':
+          description: Public cadre list
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/XRequestID' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/CadrePublic' }
+
+  /api/health/cadres:
+    get:
+      tags: [Cadres]
+      operationId: getCadreHealth
+      summary: Aggregated health/usage by cadre
+      responses:
+        '200':
+          description: Cadre health snapshot (shape TBD; non-blocking for memory)
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/XRequestID' }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+
+  /api/cadres/{cadre_id}/task:
+    post:
+      tags: [Cadres]
+      operationId: postCadreTask
+      summary: Submit a cadre-specific task (e.g., Mojo fetch health; Zoey summarize session)
+      parameters:
+        - name: cadre_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CadreTaskRequest' }
+      responses:
+        '202':
+          description: Task accepted
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/XRequestID' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CadreTaskResponse' }
+
+  /api/cadres/{cadre_id}/test:
+    post:
+      tags: [Cadres]
+      operationId: testCadre
+      summary: Execute a safe smoke test for a cadre
+      parameters:
+        - name: cadre_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Cadre responsive
+          headers:
+            X-Request-ID: { $ref: '#/components/headers/XRequestID' }
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
