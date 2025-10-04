@@ -3,7 +3,7 @@ Data Access Layer (DAL) for COM-AI v3
 Provides async database operations for PostgreSQL (authoritative store).
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import UUID, uuid4
 from typing import Optional
 import json
@@ -11,7 +11,7 @@ import os
 import asyncio
 import logging
 
-from sqlalchemy import select, update, cast
+from sqlalchemy import select, update, cast, func, and_, Integer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert as pg_insert, JSONB
 
@@ -456,6 +456,158 @@ async def log_usage(
     await db.commit()
     await db.refresh(usage)
     return usage
+
+
+# ============================================================================
+# USAGE AGGREGATION (TELEMETRY QUERIES) - NEW FOR TRACK-001
+# ============================================================================
+
+async def get_usage_summary(
+    db: AsyncSession,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+    user_id: Optional[UUID] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None
+) -> dict:
+    """
+    Aggregate usage statistics from usage_log.
+    
+    Args:
+        db: Database session
+        start_time: Filter start (defaults to 24 hours ago)
+        end_time: Filter end (defaults to now)
+        user_id: Optional user filter
+        provider: Optional provider filter
+        model: Optional model filter
+    
+    Returns:
+        Dictionary with aggregated statistics:
+        {
+            "window": {"start": "...", "end": "..."},
+            "summary": [
+                {
+                    "provider": "openai",
+                    "model": "gpt-4o-mini",
+                    "total_requests": 42,
+                    "successful_requests": 40,
+                    "failed_requests": 2,
+                    "total_tokens_in": 15000,
+                    "total_tokens_out": 23000,
+                    "avg_latency_ms": 1250.5,
+                    "total_cost_usd": null  # null until COST-001 complete
+                }
+            ],
+            "totals": {
+                "total_requests": 42,
+                "successful_requests": 40,
+                "failed_requests": 2,
+                "total_tokens_in": 15000,
+                "total_tokens_out": 23000,
+                "total_cost_usd": null  # null until COST-001 complete
+            }
+        }
+    
+    Note: cost_usd calculation requires provider pricing tables (Task COST-001).
+    Currently returns sum of existing values or null if none recorded.
+    """
+    # Default time window: last 24 hours
+    if start_time is None:
+        start_time = datetime.utcnow() - timedelta(days=1)
+    if end_time is None:
+        end_time = datetime.utcnow()
+    
+    # Build filter conditions
+    conditions = [
+        UsageLog.created_at >= start_time,
+        UsageLog.created_at <= end_time
+    ]
+    
+    if user_id:
+        conditions.append(UsageLog.user_id == user_id)
+    if provider:
+        conditions.append(UsageLog.provider == provider)
+    if model:
+        conditions.append(UsageLog.model == model)
+    
+    # Aggregate by provider and model
+    query = select(
+        UsageLog.provider,
+        UsageLog.model,
+        func.count(UsageLog.request_id).label('total_requests'),
+        func.sum(
+            func.cast(UsageLog.status == 'success', Integer)
+        ).label('successful_requests'),
+        func.sum(
+            func.cast(UsageLog.status != 'success', Integer)
+        ).label('failed_requests'),
+        func.sum(UsageLog.tokens_in).label('total_tokens_in'),
+        func.sum(UsageLog.tokens_out).label('total_tokens_out'),
+        func.avg(UsageLog.latency_ms).label('avg_latency_ms'),
+        func.sum(UsageLog.cost_usd).label('total_cost_usd')
+    ).where(
+        and_(*conditions)
+    ).group_by(
+        UsageLog.provider,
+        UsageLog.model
+    ).order_by(
+        UsageLog.provider,
+        UsageLog.model
+    )
+    
+    result = await db.execute(query)
+    rows = result.all()
+    
+    # Format response
+    summary = []
+    totals = {
+        'total_requests': 0,
+        'successful_requests': 0,
+        'failed_requests': 0,
+        'total_tokens_in': 0,
+        'total_tokens_out': 0,
+        'total_cost_usd': 0.0
+    }
+    
+    for row in rows:
+        entry = {
+            'provider': row.provider,
+            'model': row.model,
+            'total_requests': int(row.total_requests or 0),
+            'successful_requests': int(row.successful_requests or 0),
+            'failed_requests': int(row.failed_requests or 0),
+            'total_tokens_in': int(row.total_tokens_in or 0),
+            'total_tokens_out': int(row.total_tokens_out or 0),
+            'avg_latency_ms': round(float(row.avg_latency_ms), 2) if row.avg_latency_ms else None,
+            'total_cost_usd': round(float(row.total_cost_usd), 4) if row.total_cost_usd else None
+        }
+        summary.append(entry)
+        
+        # Accumulate totals
+        totals['total_requests'] += entry['total_requests']
+        totals['successful_requests'] += entry['successful_requests']
+        totals['failed_requests'] += entry['failed_requests']
+        totals['total_tokens_in'] += entry['total_tokens_in']
+        totals['total_tokens_out'] += entry['total_tokens_out']
+        if entry['total_cost_usd'] is not None:
+            totals['total_cost_usd'] += entry['total_cost_usd']
+    
+    # If no costs were recorded, set total to null
+    if totals['total_cost_usd'] == 0.0 and not any(
+        entry['total_cost_usd'] is not None for entry in summary
+    ):
+        totals['total_cost_usd'] = None
+    else:
+        totals['total_cost_usd'] = round(totals['total_cost_usd'], 4)
+    
+    return {
+        'window': {
+            'start': start_time.isoformat(),
+            'end': end_time.isoformat()
+        },
+        'summary': summary,
+        'totals': totals
+    }
 
 
 # ============================================================================
